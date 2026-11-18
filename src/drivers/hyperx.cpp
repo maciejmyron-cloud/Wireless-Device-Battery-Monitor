@@ -1,8 +1,10 @@
 // HyperX wireless headsets and Pulsefire Haste 2 mice (HP VID 03F0, older Kingston VID 0951).
-// Protocols: Pulsefire Haste 2 Core Wireless verified on hardware (03F0:0AB5), see HasteWireless;
+// Protocols: Pulsefire Haste 2 Core Wireless (03F0:0AB5) and Haste 2 Wireless (03F0:0F98) verified on hardware,
+// see HasteWireless;
 // Cloud III Wireless verified on hardware (03F0:0C9D) and github.com/Medprj/HyperXWM;
 // Cloud III S from github.com/LennardKittner/HyperHeadset; Cloud Stinger Core from
-// github.com/davidsantanaalves/HyperBatteryMonitor; the others follow github.com/Sapd/HeadsetControl.
+// github.com/davidsantanaalves/HyperBatteryMonitor (also Cloud Core Wireless DTS 0951:173F, verified on hardware);
+// the others follow github.com/Sapd/HeadsetControl.
 #include "drivers.h"
 
 #include <cmath>
@@ -119,8 +121,9 @@ bool CloudAlpha2(const HidColl& c, DeviceStatus& s) {
 
 // Pulsefire Haste 2 (Core) Wireless: NGENUITY's read-only battery query, the same 52 01 / 50 02 pair as
 // Cloud Alpha 2, on the dongle's vendor collection (interface 2). 64-byte reports.
-// From github.com/PMarinov1994/ngenuity-linux-cli (Haste 2 Wireless). Verified on a Core Wireless (03F0:0AB5);
-// the Haste 2 Wireless dongles (0D97, 0F98) are untested.
+// From github.com/PMarinov1994/ngenuity-linux-cli (Haste 2 Wireless). Verified on a Core Wireless (03F0:0AB5) and on
+// a Haste 2 Wireless (03F0:0F98, MI_02 FF00:0001, 64-byte reports; level matched NGENUITY, PR #312 by uzumakiprime);
+// the 0D97 dongle is untested. Protocol notes: docs/hyperx_haste_2.md.
 bool HasteWireless(const HidColl& c, DeviceStatus& s) {
     HidDev d;
     if (!d.Open(c)) return false;
@@ -210,6 +213,10 @@ bool Cloud3S(const HidColl& c, DeviceStatus& s) {
 // The PlayStation receivers (03F0:0A93, 0951:1713) can first hand back the previous report (FF 01 00 ...);
 // their battery reply is FF 12 05, so on them the reply is read again (up to 10 x 20 ms) until it looks right.
 // 0951:1713 (Kingston PlayStation receiver, same MI_03 layout as 0A93) was verified on hardware.
+// 0951:173F (Kingston receiver of the Cloud Core Wireless DTS, same MI_03 layout) was verified on hardware:
+// connection reply [11] == 1 when the headset is on, 3 when it is off; battery reply FF 12 05 with [9] == 03
+// while discharging and 05 while charging. The mV-to-percent curve is the Stinger Core one, not calibrated for
+// this model.
 bool StingerCore(const HidColl& c, DeviceStatus& s) {
     static const std::vector<BYTE> kConnection = { 0xFF, 0x07, 0x00, 0xFD, 0x04, 0x00, 0x00, 0x02, 0x82, 0x03,
                                                    0x05, 0x29, 0x0F, 0x00, 0x00, 0x03, 0x68, 0x10, 0x00, 0x00 };
@@ -221,7 +228,7 @@ bool StingerCore(const HidColl& c, DeviceStatus& s) {
 
     HidDev d;
     if (!d.Open(c)) return false;
-    const bool ps = c.pid == 0x0A93 || c.pid == 0x1713;
+    const bool ps = c.pid == 0x0A93 || c.pid == 0x1713 || c.pid == 0x173F;
     auto exchange = [&](const std::vector<BYTE>& cmd, std::vector<BYTE>& r, bool (*good)(const std::vector<BYTE>&)) {
         if (!d.SetFeature(cmd)) return false;
         for (int i = 0; i < (ps ? 10 : 1); i++) {
@@ -237,7 +244,7 @@ bool StingerCore(const HidColl& c, DeviceStatus& s) {
     std::vector<BYTE> r;
     // The connection reply's header isn't documented, so after 10 stale-looking reads the last one is used.
     if (!exchange(kConnection, r, fresh) && !(ps && r.size() >= 13 && !fresh(r))) return false;
-    s = Base(c.pid, L"HyperX Cloud Stinger Core Wireless");
+    s = Base(c.pid, c.pid == 0x173F ? L"HyperX Cloud Core Wireless" : L"HyperX Cloud Stinger Core Wireless");
     s.connected = r[11] == 0x01;
     if (!s.connected || !exchange(kBattery, r, battery)) return true;
     BYTE code = r[9];
@@ -266,13 +273,13 @@ const Model kModels[] = {
     { 0x0951, { 0x1718 }, [](const HidColl& c) { return c.outLen() == 62; }, Cloud2Kingston },
     { 0x03F0, { 0x098D }, [](const HidColl& c) { return c.page() >= 0xFF00 && c.outLen() >= 3; }, CloudAlpha },
     { 0x03F0, { 0x08BE }, [](const HidColl& c) { return c.page() == 0xFF13 && c.usage() == 0xFF00; }, CloudAlpha2 },
-    // Pulsefire Haste 2 Wireless (0D97, 0F98) and Haste 2 Core Wireless (0AB5) dongles.
+    // Pulsefire Haste 2 Wireless (0F98 tested, 0D97 untested) and Haste 2 Core Wireless (0AB5 tested) dongles.
     { 0x03F0, { 0x0AB5, 0x0D97, 0x0F98 }, [](const HidColl& c) { return c.page() >= 0xFF00 && c.outLen() >= 2 && c.inLen() >= 8; }, HasteWireless },
     { 0x0951, { 0x16C4, 0x1723, 0x1749 }, [](const HidColl& c) { return c.page() >= 0xFF00 && c.outLen() >= 3; }, CloudFlight },
     { 0x03F0, { 0x0E90 }, [](const HidColl& c) { return c.page() >= 0xFF00 && c.outLen() >= 3; }, CloudFlight },  // Cloud Flight (HP)
-    // Cloud Stinger Core Wireless: PlayStation receivers (HP 0A93, Kingston 1713) and the original Kingston receiver.
+    // Cloud Stinger Core Wireless: PlayStation receivers (HP 0A93, Kingston 1713) and the original Kingston receiver, and the Cloud Core Wireless DTS receiver (Kingston 173F)
     { 0x03F0, { 0x0A93 }, [](const HidColl& c) { return c.page() == 0xFF00 && c.usage() == 0x0001 && c.featLen() >= 32; }, StingerCore },
-    { 0x0951, { 0x170B, 0x1713 }, [](const HidColl& c) { return c.page() == 0xFF00 && c.usage() == 0x0001 && c.featLen() >= 32; }, StingerCore },
+    { 0x0951, { 0x170B, 0x1713, 0x173F }, [](const HidColl& c) { return c.page() == 0xFF00 && c.usage() == 0x0001 && c.featLen() >= 32; }, StingerCore },
 };
 
 }  // namespace

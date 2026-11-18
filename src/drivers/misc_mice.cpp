@@ -58,6 +58,8 @@
 //    _i() timing, Ri() sweep, Bi() on a 700 ms interval, status input report 09 parsed by its Qr()) and
 //    the W1 Service v0.1.7 binary (8F, 200 ms, 86 sweep, then report-09 reads on the first FF05 collection).
 #include "drivers.h"
+#include "xenta_protocol.h"
+#include "ardor_fury_v2_protocol.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -110,12 +112,15 @@ void PollMotospeed(PollContext& ctx) {
 }
 
 // Xenta receiver (1D57:FA60, also FA65; cable FA55 / 2155), used by Delux and Attack Shark mice.
-// The receiver broadcasts [03][model][40 or 41][state][level] every ~2 s; nothing is sent to it. The handle
+// M900 Pro reports model 30/event 40 (documented) and model 50/event 41 (captured from hardware).
+// Receivers broadcast [03][model][event][state][level] every ~2 s; nothing is sent to them. The handle
 // stays open between polls so these frames queue up. A reading counts once two frames agree, because
 // every link-up starts with a false 100% (github.com/qu1ncky/BatteryTray, XentaReceiverProvider).
 struct XentaModel { BYTE code; const wchar_t* name; bool tens; };
 const XentaModel kXentaModels[] = {
     { 0x3D, L"Delux M900 Pro", false },
+    { 0x30, L"Delux M900 Pro", false },
+    { 0x50, L"Delux M900 Pro", false },
     { 0x55, L"Attack Shark X11", false },
     { 0x4E, L"Attack Shark X3 Max", false },
     { 0xE5, L"Attack Shark V3 Pro", false },
@@ -127,6 +132,12 @@ struct XentaListener {
     std::unique_ptr<HidDev> dev;
     std::vector<BYTE> last, prev;  // the two most recent battery frames
     ULONGLONG lastFrameAt = 0;
+    // ARDOR Fury V2: keep the last CONFIRMED tier even when one new frame
+    // arrives or a polling interval contains no frames.
+    int ardorConfirmed = -1;
+    int ardorCandidate = -1;
+    int ardorCandidateCount = 0;
+    ULONGLONG ardorConfirmedAt = 0;
 };
 std::map<std::wstring, XentaListener> g_xenta;  // by collection path
 
@@ -151,15 +162,42 @@ void PollXenta(PollContext& ctx) {
                 int wait = fresh && got < 2 ? (int)std::max<LONGLONG>(1, (LONGLONG)until - (LONGLONG)GetTickCount64()) : 30;
                 if (fresh && got < 2 && (LONGLONG)until - (LONGLONG)GetTickCount64() <= 0) break;
                 if (l.dev->Read(r, wait) < 5) break;
-                if (r[0] != 0x03 || (r[2] != 0x40 && r[2] != 0x41)) continue;
+                xenta_protocol::BatteryReport frame;
+                if (!xenta_protocol::ParseBatteryReport(r, frame)) continue;
                 l.prev = l.last;
                 l.last.assign(r.begin(), r.begin() + 5);
                 l.lastFrameAt = GetTickCount64();
+                // Only ARDOR's known frame shape on FA60 uses this tier decoder.
+                // Compare decoded percent, NOT the full five bytes: the fifth
+                // byte can change when the charge tier changes.
+                if (pid == 0xFA60 && r[1] == 0x00) {
+                    int pct = ArdorFuryV2Percent(r.data(), r.size());
+                    if (pct >= 0) {
+                        if (pct == l.ardorCandidate) {
+                            if (l.ardorCandidateCount < 2) ++l.ardorCandidateCount;
+                        } else {
+                            l.ardorCandidate = pct;
+                            l.ardorCandidateCount = 1;
+                        }
+                        if (l.ardorCandidateCount >= 2) {
+                            l.ardorConfirmed = pct;
+                            l.ardorConfirmedAt = l.lastFrameAt;
+                        }
+                    }
+                }
                 got++;
             }
-            if (l.last.empty() || GetTickCount64() - l.lastFrameAt > 15000) continue;  // silent receiver: try the next one
+            // For ARDOR, an established battery reading remains usable between
+            // polls. If the dongle stops sending reports for 45 s, mark asleep
+            // rather than pretending its last known percent is current.
+            bool ardorActive = pid == 0xFA60 && l.ardorConfirmed >= 0 &&
+                GetTickCount64() - l.ardorConfirmedAt <= 45000;
+            if (l.last.empty()) continue;
+            if (!ardorActive && GetTickCount64() - l.lastFrameAt > 15000) continue;  // other Xenta / stale
             bool cable = pid == 0xFA55 || pid == 0x2155;
-            BYTE code = l.last[1], st = l.last[3], level = l.last[4];
+            xenta_protocol::BatteryReport frame;
+            if (!xenta_protocol::ParseBatteryReport(l.last, frame)) continue;
+            BYTE code = frame.model, st = frame.state, level = frame.level;
             const XentaModel* model = nullptr;
             for (const auto& m : kXentaModels)
                 if (m.code == code) model = &m;
@@ -169,7 +207,26 @@ void PollXenta(PollContext& ctx) {
             s.kind = DeviceKind::Mouse;
             s.via = cable ? L"USB cable" : L"2.4 GHz receiver";
             bool agreed = l.prev == l.last;
-            if (cable || st == 0x02 || st == 0x03) {
+            // ARDOR Fury V2 shares the FA60 receiver with other Xenta devices, but
+            // broadcasts 03 00 40 33 07 for 50% and 03 00 40 73 08 for
+            // 75%. The fifth byte is not fixed. Do not apply to other PIDs.
+            int ardorPct = (pid == 0xFA60 && !cable)
+                ? ArdorFuryV2Percent(l.last.data(), l.last.size()) : -1;
+            const bool delux = pid == 0xFA65 && (code == 0x30 || code == 0x50);
+            if (delux) {
+                if (st == 0x02) s.percent = 100;
+                else if (st == 0x03) {
+                    s.charging = true;
+                    if (level <= 100) s.percent = level;
+                } else if (agreed && st == 0x01 && level >= 1 && level <= 100) {
+                    s.percent = level;
+                }
+            } else if (ardorPct >= 0) {
+                s.name = L"ARDOR GAMING Fury V2";
+                if (ardorActive) s.percent = l.ardorConfirmed;
+                // While a tier changes, show the last confirmed value instead
+                // of flashing `asleep`. New tier is committed after 2 reports.
+            } else if (cable || st == 0x02 || st == 0x03) {
                 s.charging = true;  // the level is frozen on external power
                 if (st == 0x02 && !cable) s.percent = 100;
             } else if (agreed) {

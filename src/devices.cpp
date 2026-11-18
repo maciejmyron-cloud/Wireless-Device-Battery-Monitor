@@ -51,12 +51,16 @@ std::vector<DeviceStatus> PollAllDevices() {
     PollDareu(ctx);
     PollDarmoshark(ctx);
     PollAtkSerial(ctx);  // before Kysona, which shares the ATK vendor id
+    PollAtkKeyboard(ctx);
     PollPulsar(ctx);     // before Kysona, which also scans the 3710 vendor id
     PollAtkBitmouse(ctx);  // before Kysona, which would probe the NK dongle with the wrong protocol
     PollKysona(ctx);
     PollKeychron(ctx);
+    PollCherry(ctx);
+    PollArbiter(ctx);    // before Lamzu, which shares the 373E vendor id
     PollLamzu(ctx);
     PollEndgame(ctx);
+    PollEndgameWe(ctx);
     PollVaxee(ctx);
     PollWlmouse(ctx);
     PollFinalmouse(ctx);
@@ -64,6 +68,7 @@ std::vector<DeviceStatus> PollAllDevices() {
     PollSprime(ctx);
     PollRongyuan(ctx);
     PollSonix(ctx);
+    PollSemico(ctx);
     PollSonyInzone(ctx);
     PollFractal(ctx);
     PollJabra(ctx);
@@ -77,28 +82,39 @@ std::vector<DeviceStatus> PollAllDevices() {
     PollMchoseG3(ctx);
     PollMsi(ctx);
     PollMachenike(ctx);  // before Ajazz in PollMiscMice, which shares the L7's 248A vendor id
+    PollNiceboy(ctx);    // exact 248A:FA02 match, also before the Ajazz / Delux pollers
     PollMchoseModern(ctx);
+    PollMchoseHeadset(ctx);
     PollMiscMice(ctx);
     PollFantech(ctx);
     PollRazerHeadsets(ctx);  // before the generic Razer driver, which shares the vendor id
+    PollBarracudaPro(ctx);   // before the generic Razer driver as well
     PollHyperX(ctx);
     PollLogitechG435(ctx);  // before the HID++ driver, which shares the vendor id
     PollAstro(ctx);
     PollLogitech(ctx);
     PollRazer(ctx);
+    PollSteelSeriesElite(ctx);
     PollSteelSeries(ctx);
+    PollAudeze(ctx);
+    PollNzxt(ctx);
+    PollPlantronics(ctx);
     PollCorsair(ctx);
     PollCoolerMaster(ctx);
     PollPlayStation(ctx);
+    PollSwitchPro(ctx);
     PollSteamController(ctx);
     PollGameSir(ctx);
     PollFlydigi(ctx);
     PollGameSirCyclone(ctx);
     Poll8BitDo(ctx);
+    PollBeitong(ctx);  // before the XInput fallback, which only sees the receiver as wired
     PollAirPods(ctx);  // before the Bluetooth fallback, which has no level for AirPods
     PollPhoneLink(ctx);
     PollGalaxyBuds(ctx);  // before the Bluetooth fallback, which skips devices already listed by name
     PollMoondrop(ctx);
+    PollAlienware(ctx);
+    PollMaono(ctx);  // MAONO PD200W receiver (352F:040E), experimental battery query
     PollHeadsetControl(ctx);
     PollBluetooth(ctx);   // before the generic HID check: Windows' own level wins for the same device
     PollGenericHid(ctx);

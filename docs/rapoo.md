@@ -56,6 +56,43 @@ After the owner disconnected the cable and reconnected the receiver, the final e
 `52%` over `2.4 GHz receiver`, without the charging flag, and retained the same `rapoo:4617` key.
 This also verifies the cable-to-receiver transition against live hardware.
 
+Also tested on Windows with a **VT9 Gen 2** on 2026-11-17:
+
+| Connection | VID:PID | Interface | Usage page:usage | Input / output size |
+|---|---|---|---|---|
+| 2.4 GHz receiver | `24AE:1414` | 1 | `FF00:0002` | 16 / 16 bytes |
+| USB cable | `24AE:4614` | 1 | `FF00:0002` | 19 / 19 bytes |
+
+The VT9 Gen 2 receiver exposes a **16-byte** `FF00:0002` report rather than 19 bytes, using the exact
+same Nordic 54L `07` layout (including the embedded `4614` PID at bytes 13–14). Captured frames:
+
+```text
+07 10 03 40 06 40 06 01 64 00 03 01 00 14 46 01             # receiver: 100%, discharging
+07 12 04 80 0C 80 0C 02 64 00 03 01 00 14 46 01 02 02 00    # USB cable (switch ON): 100%, charging
+```
+
+Over USB cable, status reports were observed on interaction (e.g., DPI change); with the bottom
+power switch turned OFF while plugged in, the mouse reported `state=2, percent=1` instead of the
+actual battery percentage.
+
+### VT3 Max Gen 2 receiver with a 13-byte collection (issue #1396)
+
+A device-request form report for the same receiver ID `24AE:1417` listed a different interface
+layout: `FF00:0002` with **13 / 13** bytes (instead of 19), and `FF00:000E` with 33 / 33 bytes,
+with no 513-byte firmware collection. This looks like another receiver firmware revision. The
+Rapoo software still showed the battery, so the driver ignored a working status channel.
+
+Rapoo Hub's `VT_nrf54L` decoder (`py`) is length-adaptive: it always reads the DPI, battery
+state and percentage, and reads the later fields (mouse PID at `n[12..13]`, RF info, ...) only
+when the report is long enough. The VT3 MAX manifest (`productId: [17943, 5143]`) has no special
+input-report type, so report `07` goes through that decoder on this receiver too. A 13-byte report
+(ID plus 12 bytes) still carries state at byte 7 and percentage at byte 8; only the embedded mouse
+PID is missing, so the reading uses the receiver PID and keeps the `rapoo:4617` key.
+
+The 13-byte length is accepted **only for `24AE:1417`**. Frames must still pass the same checks
+(report `07`, connection nibble 0–2, state 1/2, percentage 0–100). No live 13-byte frame has
+been captured yet; the tests use the tested 19-byte capture cut to 13 bytes.
+
 ## Other Rapoo mice
 
 The official Rapoo Hub uses this `07` layout for its Nordic 54L mouse driver. Its manifests
@@ -105,9 +142,11 @@ separate verified implementation. Do not send guessed queries to them.
 
 ## Polling and identity
 
-- Reading is passive. The deadline is 4 seconds per matching collection, allowing a documented
-  legacy push interval of roughly 3.2 seconds. Unrelated packets do not restart that deadline.
-- No queued status is flushed. Each refresh opens a fresh handle and closes it after reading.
+- Reading is passive. Matching `FF00:0002` handles stay open between polls (matching `PollXenta`)
+  so Windows buffers status frames arriving during the 60-second refresh interval; each poll drains
+  any queued frames (keeping the newest valid battery reading) before falling back to a 5-second
+  wait on first open or an empty queue. Unplugged devices are removed and their handles closed.
+  Unrelated packets do not restart the deadline.
 - The embedded mouse PID, or a known cable/receiver pair for legacy devices, gives the same UI key
   across cable changes. Cable and receiver readings are merged into one entry, preferring the cable's
   state while preserving a valid receiver percentage if the cable reports an unknown level.

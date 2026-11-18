@@ -22,6 +22,7 @@ PollContext Poll(std::vector<std::vector<BYTE>> data, HidColl c = Collection()) 
     PollContext ctx; ctx.colls = {c}; PollAstro(ctx); return ctx;
 }
 }
+std::wstring Hex4(USHORT v) { wchar_t b[8]; swprintf(b, 8, L"%04X", v); return b; }  // used by the Gen 3 / Gen 4 / A20 paths
 bool HidDev::Open(const HidColl& c) { ++opens; c_ = c; return openOk; }
 void HidDev::Close() {}
 void HidDev::Flush() {}

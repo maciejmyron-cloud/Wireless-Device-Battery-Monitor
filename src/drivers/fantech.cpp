@@ -21,6 +21,7 @@ namespace {
 const USHORT kVid = 0x25A7;
 const USHORT kPidWired = 0xFA7B;
 const USHORT kPidDongle = 0xFA7C;
+const USHORT kPidRedragon = 0xFA7E;
 
 constexpr BYTE kReportId = 0x08;
 constexpr size_t kPacketLen = 17;
@@ -105,7 +106,7 @@ bool QueryBattery(HidDev& cmd, const std::vector<HidDev*>& readers, int& pct, bo
 
 void PollFantech(PollContext& ctx) {
     for (auto [vid, pid] : ctx.Products(kVid)) {
-        if (pid != kPidWired && pid != kPidDongle) continue;
+        if (pid != kPidWired && pid != kPidDongle && pid != kPidRedragon) continue;
 
         std::vector<const HidColl*> all = ctx.Find(vid, pid, [](const HidColl&) { return true; });
         const HidColl* feat = nullptr;
@@ -133,10 +134,11 @@ void PollFantech(PollContext& ctx) {
         int pct = -1;
         bool charging = false;
         if (!QueryBattery(cmd, readers, pct, charging)) continue;
+        if (pid == kPidRedragon) pct = Clamp100(pct * 10);
 
         DeviceStatus s;
-        s.key = L"fantech:" + Hex4(pid);
-        s.name = L"Fantech Helios Go XD5";
+        s.key = (pid == kPidRedragon ? L"redragon:" : L"fantech:") + Hex4(pid);
+        s.name = (pid == kPidRedragon) ? L"Redragon Invader Pro" : L"Fantech Helios Go XD5";
         s.kind = DeviceKind::Mouse;
         s.via = pid == kPidWired ? L"USB cable" : L"2.4 GHz receiver";
         s.percent = pct;

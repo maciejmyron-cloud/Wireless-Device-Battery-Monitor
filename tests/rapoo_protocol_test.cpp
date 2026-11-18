@@ -24,6 +24,32 @@ int main() {
     assert(b.percent == 25 && b.charging && b.mousePid == 0x4617);
     assert(b.connection == Rapoo::Connection::Cable);
 
+    // Captured on a VT9 Gen 2, receiver 24AE:1414, FF00:0002 (16-byte input report).
+    const std::vector<std::uint8_t> capturedVt9 = {
+        0x07, 0x10, 0x03, 0x40, 0x06, 0x40, 0x06, 0x01,
+        0x64, 0x00, 0x03, 0x01, 0x00, 0x14, 0x46, 0x01
+    };
+    assert(Rapoo::DecodeBattery(capturedVt9.data(), capturedVt9.size(), b));
+    assert(b.percent == 100 && !b.charging && b.mousePid == 0x4614);
+    assert(b.connection == Rapoo::Connection::Receiver);
+
+    // 13-byte VT3 Max Gen 2 receiver collection (issue #1396): no room for the mouse PID.
+    const std::vector<std::uint8_t> short13 = {
+        0x07, 0x20, 0x03, 0x20, 0x03, 0x20, 0x03, 0x01, 0x19, 0x00, 0x04, 0x84, 0x00
+    };
+    assert(Rapoo::DecodeBattery(short13.data(), short13.size(), b));
+    assert(b.percent == 25 && !b.charging && b.mousePid == 0);
+    assert(b.connection == Rapoo::Connection::Receiver);
+
+    // Captured on the same VT9 Gen 2 over USB cable 24AE:4614, FF00:0002 (19-byte input report).
+    const std::vector<std::uint8_t> capturedVt9Cable = {
+        0x07, 0x12, 0x04, 0x80, 0x0C, 0x80, 0x0C, 0x02, 0x64, 0x00,
+        0x03, 0x01, 0x00, 0x14, 0x46, 0x01, 0x02, 0x02, 0x00
+    };
+    assert(Rapoo::DecodeBattery(capturedVt9Cable.data(), capturedVt9Cable.size(), b));
+    assert(b.percent == 100 && b.charging && b.mousePid == 0x4614);
+    assert(b.connection == Rapoo::Connection::Cable);
+
     auto modern = captured;
     modern[1] = 0x22; // sensor bits must not affect the connection type
     modern[7] = 2;

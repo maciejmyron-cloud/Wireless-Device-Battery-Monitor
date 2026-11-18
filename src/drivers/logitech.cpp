@@ -260,7 +260,8 @@ bool PollLogitechDevice(PollContext& ctx, USHORT pid, const std::vector<const Hi
     std::wstring path = (longs.empty() ? shorts[0] : longs[0])->path;
     for (auto& ch : path) ch = towlower(ch);
     bool bluetooth = path.find(L"{00001812-") != std::wstring::npos || path.find(L"{00001124-") != std::wstring::npos;
-    if (IsPassthroughDongle(pid))
+    const bool passthrough = IsPassthroughDongle(pid);
+    if (passthrough)
         indices = { 1 };
     else if (bluetooth ||
              (!isReceiver && h.Request(0xFF, 0x00, 0x10 | kSwId, { 0, 0, 0x5A }, p, err, false, 400) == 1 && p.size() >= 3 && p[0] >= 2))
@@ -275,7 +276,7 @@ bool PollLogitechDevice(PollContext& ctx, USHORT pid, const std::vector<const Hi
         s.name = (idx == 0xFF && !product.empty()) ? product : L"Logitech wireless device";
         s.via = idx == 0xFF ? L"USB / Bluetooth" : L"Logitech receiver";
         s.graceSec = idx == 0xFF ? 0 : 1800;  // receiver devices drop off the link while sleeping
-        s.kind = GuessKind(s.name);
+        s.kind = passthrough ? DeviceKind::Mouse : GuessKind(s.name);
 
         int r = h.Request(idx, 0x00, 0x10 | kSwId, { 0, 0, 0x5A }, p, err, false, 400);
         bool found = false;
@@ -306,9 +307,17 @@ bool PollLogitechDevice(PollContext& ctx, USHORT pid, const std::vector<const Hi
 
 void PollLogitech(PollContext& ctx) {
     for (auto [vid, pid] : ctx.Products(0x046D)) {
-        auto allShorts = ctx.Find(vid, pid, [](const HidColl& c) { return c.page() == 0xFF00 && c.usage() == 0x0001 && c.outLen() == 7; });
-        auto allLongs = ctx.Find(vid, pid, [](const HidColl& c) {
-            return ((c.page() == 0xFF00 && c.usage() == 0x0002) || (c.page() == 0xFF43 && c.usage() == 0x0202)) && c.outLen() == 20;
+        const bool passthrough = IsPassthroughDongle(pid);
+        // The SUPERSTRIKE receiver exposes HID++ on FF43:0301 (short) and FF43:0302 (long).
+        auto allShorts = ctx.Find(vid, pid, [passthrough](const HidColl& c) {
+            return c.outLen() == 7 &&
+                   ((c.page() == 0xFF00 && c.usage() == 0x0001) ||
+                    (passthrough && c.page() == 0xFF43 && c.usage() == 0x0301));
+        });
+        auto allLongs = ctx.Find(vid, pid, [passthrough](const HidColl& c) {
+            return c.outLen() == 20 &&
+                   ((c.page() == 0xFF00 && c.usage() == 0x0002) ||
+                    (c.page() == 0xFF43 && (c.usage() == 0x0202 || (passthrough && c.usage() == 0x0302))));
         });
 
         // One group per physical device: its short and long HID++ collections.

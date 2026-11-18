@@ -14,6 +14,8 @@
 #include <vector>
 
 #include "devices.h"
+#include "i18n.h"
+#include "labels.h"
 #include "report.h"
 #include "widget.h"
 
@@ -30,6 +32,9 @@ constexpr UINT PLACEHOLDER_ID = 1;
 
 enum MenuId : UINT {
     ID_REFRESH = 100, ID_AUTOSTART, ID_HIDE_LAST_KNOWN, ID_WIDGET_BACKGROUND, ID_EXIT, ID_MODE_WIDGET, ID_MODE_TRAY, ID_SUPPORT, ID_REPORT,
+    ID_BRAND_COLORS, ID_STACKED,
+    ID_LANG_AUTO = 400, ID_LANG_ADD, ID_LANG_FIRST,  // "Language": ID_LANG_FIRST + 0..63
+    ID_MONITOR_ALL = 300, ID_MONITOR_MAIN, ID_MONITOR_FIRST,  // "Show the widget on": ID_MONITOR_FIRST + 0..31
     ID_DEVICE_FIRST = 1000
 };
 enum DeviceCmd : UINT { DEV_TOGGLE, DEV_LEFT, DEV_RIGHT, DEV_STRIDE = 4 };
@@ -48,7 +53,10 @@ bool g_lightTaskbar;
 bool g_wantWidget = true;      // user's choice: taskbar widget (default) or tray icons
 bool g_useWidget = false;      // what is actually shown right now
 bool g_hideLastKnown = false;  // hide (last known) / asleep devices from taskbar and tray
+std::wstring g_widgetMonitor = L"all";  // which taskbars show the widget: "all", "main" or one monitor id
 bool g_widgetBackground = false;  // draw a plate behind the taskbar text (transparent taskbar themes)
+bool g_stacked = false;      // icon above the percentage (menu option)
+bool g_brandColors = false;  // off by default; known brands get their color (Razer green, Logitech blue, ...)
 
 struct TrayEntry {
     UINT uid = 0;
@@ -161,6 +169,25 @@ bool LoadHideLastKnown() { return LoadBoolSetting(L"HideLastKnownDevices", false
 void SaveHideLastKnown(bool on) { SaveBoolSetting(L"HideLastKnownDevices", on); }
 bool LoadWidgetBackground() { return LoadBoolSetting(L"WidgetBackground", false); }
 void SaveWidgetBackground(bool on) { SaveBoolSetting(L"WidgetBackground", on); }
+std::wstring LoadWidgetMonitor() {
+    wchar_t buf[512] = {};
+    DWORD size = sizeof(buf) - sizeof(wchar_t);
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, L"WidgetMonitor", RRF_RT_REG_SZ, nullptr, buf, &size) == ERROR_SUCCESS && buf[0])
+        return buf;
+    return LoadBoolSetting(L"OtherTaskbars", true) ? L"all" : L"main";  // the earlier on/off toggle
+}
+void SaveWidgetMonitor(const std::wstring& v) {
+    RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, L"WidgetMonitor", REG_SZ, v.c_str(), (DWORD)((v.size() + 1) * sizeof(wchar_t)));
+}
+void SetWidgetMonitor(const std::wstring& v) {
+    g_widgetMonitor = v;
+    SaveWidgetMonitor(v);
+    widget::SetMonitorChoice(v);
+}
+bool LoadStacked() { return LoadBoolSetting(L"StackedLayout", false); }
+void SaveStacked(bool on) { SaveBoolSetting(L"StackedLayout", on); }
+bool LoadBrandColors() { return LoadBoolSetting(L"BrandColors", false); }
+void SaveBrandColors(bool on) { SaveBoolSetting(L"BrandColors", on); }
 
 bool AutostartEnabled() {
     wchar_t buf[MAX_PATH * 2];
@@ -281,11 +308,15 @@ HICON RenderIcon(const std::wstring& text, int barPct, Rgb textColor, Rgb barCol
 
 Rgb Foreground() { return g_lightTaskbar ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 }; }
 
-HICON IconFor(int pct, bool charging, bool dim) {
+Accent AccentFor(const DeviceStatus& s) { return g_brandColors ? BrandOf(s) : Accent::None; }
+
+HICON IconFor(int pct, bool charging, bool dim, Accent accent) {
     Rgb fg = Foreground();
+    BrandColor bc = AccentColor(accent, g_lightTaskbar);
     Rgb bar = charging        ? Rgb{ 0, 170, 255 }
             : pct <= LOW_BATTERY ? Rgb{ 232, 32, 48 }
             : pct <= 30       ? Rgb{ 255, 150, 0 }
+            : accent != Accent::None ? Rgb{ bc.r, bc.g, bc.b }
                               : Rgb{ 30, 190, 90 };
     Rgb text = (!charging && pct >= 0 && pct <= LOW_BATTERY) ? Rgb{ 240, 50, 60 } : fg;
     std::wstring t = pct < 0 ? L"?" : std::to_wstring(pct);
@@ -301,15 +332,15 @@ void CopyTip(wchar_t* dst, size_t cap, const std::wstring& s) {
 
 std::wstring StatusText(const TrayEntry& e) {
     const auto& s = e.st;
-    if (!s.connected) return L"off / not connected";
+    if (!s.connected) return T(L"off / not connected");
     std::wstring t;
-    if (!s.levelText.empty() && s.percent >= 0) t = s.levelText;
+    if (!s.levelText.empty() && s.percent >= 0) t = T(s.levelText);
     else if (s.percent >= 0) t = std::to_wstring(s.percent) + L"%";
-    else if (e.lastPct >= 0) t = std::to_wstring(e.lastPct) + L"% (last known)";
-    else t = L"unknown";
+    else if (e.lastPct >= 0) t = TF(L"{percent}% (last known)", { { L"percent", std::to_wstring(e.lastPct) } });
+    else t = T(L"unknown");
     if (!s.detail.empty() && s.percent >= 0) t += L" (" + s.detail + L")";
-    if (s.charging) t += L", charging";
-    if (s.asleep) t += L", asleep";
+    if (s.charging) t += std::wstring(L", ") + T(L"charging");
+    if (s.asleep) t += std::wstring(L", ") + T(L"asleep");
     return t;
 }
 
@@ -351,7 +382,7 @@ void UpdatePlaceholder() {
     for (auto& [k, e] : g_entries) any |= e.added;
     if (!any && !g_placeholder) {
         if (!g_placeholderIcon) g_placeholderIcon = RenderIcon(L"-", -1, Foreground(), Foreground(), true);
-        TrayCall(NIM_ADD, PLACEHOLDER_ID, g_placeholderIcon, L"Wireless Battery\nNo devices with battery info found");
+        TrayCall(NIM_ADD, PLACEHOLDER_ID, g_placeholderIcon, std::wstring(L"Wireless Battery\n") + T(L"No devices with battery info found"));
         g_placeholder = true;
     } else if (any && g_placeholder) {
         TrayDelete(PLACEHOLDER_ID);
@@ -368,10 +399,12 @@ void ApplyEntry(TrayEntry& e) {
     }
     int shown = s.percent >= 0 ? s.percent : e.lastPct;
     bool dim = s.percent < 0;
-    std::wstring sig = std::to_wstring(shown) + (s.charging ? L"c" : L"") + (dim ? L"d" : L"") + (g_lightTaskbar ? L"l" : L"k");
+    Accent accent = AccentFor(s);
+    std::wstring sig = std::to_wstring(shown) + (s.charging ? L"c" : L"") + (dim ? L"d" : L"") + (g_lightTaskbar ? L"l" : L"k") +
+                       L"a" + std::to_wstring((int)accent);
     if (sig != e.iconSig || !e.icon) {
         if (e.icon) DestroyIcon(e.icon);
-        e.icon = IconFor(shown, s.charging, dim);
+        e.icon = IconFor(shown, s.charging, dim, accent);
         e.iconSig = sig;
     }
     std::wstring tip = s.name + L"\n" + StatusText(e);
@@ -381,8 +414,8 @@ void ApplyEntry(TrayEntry& e) {
     if (s.charging || shown > LOW_BATTERY + 10) e.lowWarned = false;
     if (!s.charging && s.percent >= 0 && s.percent <= LOW_BATTERY && !e.lowWarned) {
         e.lowWarned = true;
-        infoTitle = L"Low battery";
-        info = s.name + L" is at " + std::to_wstring(s.percent) + L"%";
+        infoTitle = T(L"Low battery");
+        info = TF(L"{name} is at {percent}%", { { L"name", s.name }, { L"percent", std::to_wstring(s.percent) } });
     }
     TrayCall(e.added ? NIM_MODIFY : NIM_ADD, e.uid, e.icon, tip, infoTitle, info);
     e.added = true;
@@ -416,7 +449,8 @@ std::vector<TrayEntry*> OrderedEntries(bool shownOnly) {
         int ra = rank(a), rb = rank(b);
         if (ra != rb) return ra < rb;
         int ka = KindOrder(a->st.kind), kb = KindOrder(b->st.kind);
-        return ka != kb ? ka < kb : a->st.name < b->st.name;
+        if (ka != kb) return ka < kb;
+        return a->st.name != b->st.name ? a->st.name < b->st.name : a->st.key < b->st.key;  // same name: keep a fixed order
     });
     return list;
 }
@@ -424,22 +458,28 @@ std::vector<TrayEntry*> OrderedEntries(bool shownOnly) {
 void UpdateWidget() {
     if (!g_useWidget) return;
     std::vector<TrayEntry*> list = OrderedEntries(true);
+    // Two devices of one kind share an icon: give each a tiny caption so they can be told apart.
+    std::vector<LabelInput> labelIn;
+    for (auto* e : list) labelIn.push_back({ e->st.kind, e->st.name });
+    std::vector<std::wstring> labels = ShortLabels(labelIn, 3);
     std::vector<WidgetItem> items;
     std::wstring tip;
     for (auto* e : list) {
         WidgetItem it;
         it.kind = e->st.kind;
         it.percent = e->st.percent >= 0 ? e->st.percent : e->lastPct;
-        if (e->st.percent >= 0) it.text = e->st.levelText;
+        if (e->st.percent >= 0) it.text = T(e->st.levelText);
         it.charging = e->st.charging;
         it.dim = e->st.percent < 0;
         it.low = !it.charging && it.percent >= 0 && it.percent <= LOW_BATTERY;
         it.bluetooth = e->st.via == L"Bluetooth";
+        it.label = labels[items.size()];
+        it.accent = AccentFor(e->st);
         items.push_back(it);
         if (!tip.empty()) tip += L"\n";
         tip += e->st.name + L": " + StatusText(*e);
     }
-    if (tip.empty()) tip = L"Wireless Battery: no devices with battery info found";
+    if (tip.empty()) tip = std::wstring(L"Wireless Battery: ") + T(L"No devices with battery info found");
     widget::SetItems(items, tip);
 }
 
@@ -519,6 +559,9 @@ void ReAddAll() {
     UpdatePlaceholder();
 }
 
+// Switches the UI language ("" = follow Windows) and redraws everything that shows text.
+void SetLanguage(const std::wstring& code);
+
 void RedrawAll() {
     if (g_placeholderIcon) {
         DestroyIcon(g_placeholderIcon);
@@ -527,6 +570,25 @@ void RedrawAll() {
     }
     for (auto& [k, e] : g_entries) { e.iconSig.clear(); ApplyEntry(e); }
     UpdatePlaceholder();
+}
+
+void SetLanguage(const std::wstring& code) {
+    i18n::SetChoice(code);
+    RedrawAll();  // tray tooltips and the placeholder text
+    UpdateWidget();
+}
+
+void SetStacked(bool on) {
+    g_stacked = on;
+    SaveStacked(on);
+    widget::SetStacked(on);
+}
+
+void SetBrandColors(bool on) {
+    g_brandColors = on;
+    SaveBrandColors(on);
+    RedrawAll();
+    UpdateWidget();
 }
 
 void ToggleHidden(const std::wstring& key) {
@@ -560,8 +622,8 @@ void ShowMenu() {
     HMENU m = CreatePopupMenu();
     std::vector<std::wstring> keys;  // device index -> device key; menu id ID_DEVICE_FIRST + index * DEV_STRIDE + command
     std::vector<TrayEntry*> all = OrderedEntries(false), shown = OrderedEntries(true);
-    if (all.empty()) AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"No devices with battery info found");
-    else AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"Point at a device to show, hide or move it");
+    if (all.empty()) AppendMenuW(m, MF_STRING | MF_GRAYED, 0, T(L"No devices with battery info found"));
+    else AppendMenuW(m, MF_STRING | MF_GRAYED, 0, T(L"Point at a device to show, hide or move it"));
     for (TrayEntry* e : all) {
         const std::wstring& k = e->st.key;
         UINT base = ID_DEVICE_FIRST + (UINT)keys.size() * DEV_STRIDE;
@@ -570,32 +632,74 @@ void ShowMenu() {
         bool canRight = pos != shown.end() && pos + 1 != shown.end();
         HMENU sub = CreatePopupMenu();
         AppendMenuW(sub, MF_STRING | (IsHidden(k) ? 0 : MF_CHECKED), base + DEV_TOGGLE,
-                    g_wantWidget ? L"Show on the taskbar" : L"Show in the tray");
+                    g_wantWidget ? T(L"Show on the taskbar") : T(L"Show in the tray"));
         AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(sub, MF_STRING | (canLeft ? 0 : MF_GRAYED), base + DEV_LEFT, g_wantWidget ? L"Move left" : L"Move up");
-        AppendMenuW(sub, MF_STRING | (canRight ? 0 : MF_GRAYED), base + DEV_RIGHT, g_wantWidget ? L"Move right" : L"Move down");
-        std::wstring line = e->st.name + L":  " + StatusText(*e) + L"   [" + e->st.via + L"]";
+        AppendMenuW(sub, MF_STRING | (canLeft ? 0 : MF_GRAYED), base + DEV_LEFT, g_wantWidget ? T(L"Move left") : T(L"Move up"));
+        AppendMenuW(sub, MF_STRING | (canRight ? 0 : MF_GRAYED), base + DEV_RIGHT, g_wantWidget ? T(L"Move right") : T(L"Move down"));
+        std::wstring line = e->st.name + L":  " + StatusText(*e) + L"   [" + T(e->st.via) + L"]";
         AppendMenuW(m, MF_POPUP | (IsHidden(k) ? 0 : MF_CHECKED), (UINT_PTR)sub, line.c_str());
         keys.push_back(k);
     }
-    AppendMenuW(m, MF_STRING | (g_hideLastKnown ? MF_CHECKED : 0), ID_HIDE_LAST_KNOWN, L"Hide last known / asleep devices");
+    AppendMenuW(m, MF_STRING | (g_hideLastKnown ? MF_CHECKED : 0), ID_HIDE_LAST_KNOWN, T(L"Hide last known / asleep devices"));
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING | (g_wantWidget ? MF_CHECKED : 0), ID_MODE_WIDGET, L"Show on the taskbar (icon + percentage)");
-    AppendMenuW(m, MF_STRING | (!g_wantWidget ? MF_CHECKED : 0), ID_MODE_TRAY, L"Show as tray icons");
+    AppendMenuW(m, MF_STRING | (g_wantWidget ? MF_CHECKED : 0), ID_MODE_WIDGET, T(L"Show on the taskbar (icon + percentage)"));
+    AppendMenuW(m, MF_STRING | (!g_wantWidget ? MF_CHECKED : 0), ID_MODE_TRAY, T(L"Show as tray icons"));
     CheckMenuRadioItem(m, ID_MODE_WIDGET, ID_MODE_TRAY, g_wantWidget ? ID_MODE_WIDGET : ID_MODE_TRAY, MF_BYCOMMAND);
     UINT bgFlags = MF_STRING | (g_widgetBackground ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED);
-    AppendMenuW(m, bgFlags, ID_WIDGET_BACKGROUND, L"Background behind taskbar text (for transparent taskbars)");
+    AppendMenuW(m, bgFlags, ID_WIDGET_BACKGROUND, T(L"Background behind taskbar text (for transparent taskbars)"));
+    AppendMenuW(m, MF_STRING | (g_stacked ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED), ID_STACKED, T(L"Icons above percentages (narrower)"));
+    // With more than one monitor: choose which taskbars show the widget (all, main only, or one monitor).
+    auto monitors = widget::OtherMonitors();
+    if (monitors.size() > 31) monitors.resize(31);
+    if (!monitors.empty()) {
+        HMENU sub = CreatePopupMenu();
+        UINT f = MF_STRING | (g_wantWidget ? 0 : MF_GRAYED);
+        AppendMenuW(sub, f, ID_MONITOR_ALL, T(L"All monitors"));
+        AppendMenuW(sub, f, ID_MONITOR_MAIN, T(L"Main monitor only"));
+        UINT checked = g_widgetMonitor == L"main" ? ID_MONITOR_MAIN : ID_MONITOR_ALL;
+        bool found = g_widgetMonitor == L"all" || g_widgetMonitor == L"main";
+        for (UINT i = 0; i < monitors.size(); i++) {
+            AppendMenuW(sub, f, ID_MONITOR_FIRST + i, TF(L"{monitor} only", { { L"monitor", monitors[i].label } }).c_str());
+            if (monitors[i].id == g_widgetMonitor) { checked = ID_MONITOR_FIRST + i; found = true; }
+        }
+        if (!found) {  // the chosen monitor is unplugged: the main taskbar shows the widget meanwhile
+            AppendMenuW(sub, MF_STRING | MF_GRAYED, ID_MONITOR_FIRST + 31, T(L"Chosen monitor (not connected, shown on main)"));
+            checked = ID_MONITOR_FIRST + 31;
+        }
+        CheckMenuRadioItem(sub, ID_MONITOR_ALL, ID_MONITOR_FIRST + 31, checked, MF_BYCOMMAND);
+        AppendMenuW(m, MF_POPUP | (g_wantWidget ? 0 : MF_GRAYED), (UINT_PTR)sub, T(L"Show the widget on"));
+    }
+    AppendMenuW(m, MF_STRING | (g_brandColors ? MF_CHECKED : 0), ID_BRAND_COLORS, T(L"Brand colors (Razer green, Logitech blue, ...)"));
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, ID_REFRESH, L"Refresh now");
-    AppendMenuW(m, MF_STRING | (AutostartEnabled() ? MF_CHECKED : 0), ID_AUTOSTART, L"Start with Windows");
-    AppendMenuW(m, MF_STRING, ID_REPORT, L"Request support for a device...");
-    AppendMenuW(m, MF_STRING, ID_SUPPORT, L"Support the project...");
+    // Language: automatic, every built-in or user-added language (in its own name), and a way to add one.
+    i18n::Init();  // picks up language files added since the last time
+    auto languages = i18n::Available();
+    if (languages.size() > 64) languages.resize(64);
+    {
+        HMENU sub = CreatePopupMenu();
+        AppendMenuW(sub, MF_STRING, ID_LANG_AUTO, T(L"Automatic (Windows language)"));
+        AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+        UINT checked = ID_LANG_AUTO;
+        for (UINT i = 0; i < languages.size(); i++) {
+            AppendMenuW(sub, MF_STRING, ID_LANG_FIRST + i, languages[i].name.c_str());
+            if (!i18n::Choice().empty() && _wcsicmp(languages[i].code.c_str(), i18n::Choice().c_str()) == 0) checked = ID_LANG_FIRST + i;
+        }
+        CheckMenuRadioItem(sub, ID_LANG_AUTO, ID_LANG_FIRST + 63, checked, MF_BYCOMMAND);
+        AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(sub, MF_STRING, ID_LANG_ADD, T(L"Add your own language..."));
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, T(L"Language"));
+    }
+    AppendMenuW(m, MF_STRING, ID_REFRESH, T(L"Refresh now"));
+    AppendMenuW(m, MF_STRING | (AutostartEnabled() ? MF_CHECKED : 0), ID_AUTOSTART, T(L"Start with Windows"));
+    AppendMenuW(m, MF_STRING, ID_REPORT, T(L"Request support for a device..."));
+    AppendMenuW(m, MF_STRING, ID_SUPPORT, T(L"Support the project..."));
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, ID_EXIT, L"Exit");
+    AppendMenuW(m, MF_STRING, ID_EXIT, T(L"Exit"));
     POINT pt;
     GetCursorPos(&pt);
     SetForegroundWindow(g_hwnd);
-    UINT cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hwnd, nullptr);
+    UINT cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | (i18n::Rtl() ? TPM_LAYOUTRTL : 0), pt.x, pt.y, 0,
+                              g_hwnd, nullptr);
     PostMessageW(g_hwnd, WM_NULL, 0, 0);
     DestroyMenu(m);
     switch (cmd) {
@@ -603,13 +707,23 @@ void ShowMenu() {
         case ID_AUTOSTART: SetAutostart(!AutostartEnabled()); break;
         case ID_HIDE_LAST_KNOWN: SetHideLastKnown(!g_hideLastKnown); break;
         case ID_WIDGET_BACKGROUND: SetWidgetBackground(!g_widgetBackground); break;
+        case ID_MONITOR_ALL: SetWidgetMonitor(L"all"); break;
+        case ID_LANG_AUTO: SetLanguage(L""); break;
+        case ID_LANG_ADD: i18n::OpenUserFolder(); break;
+        case ID_MONITOR_MAIN: SetWidgetMonitor(L"main"); break;
+        case ID_BRAND_COLORS: SetBrandColors(!g_brandColors); break;
+        case ID_STACKED: SetStacked(!g_stacked); break;
         case ID_MODE_WIDGET: SetMode(true); break;
         case ID_MODE_TRAY: SetMode(false); break;
         case ID_SUPPORT: ShellExecuteW(nullptr, L"open", L"https://github.com/sponsors/krisgfx9", nullptr, nullptr, SW_SHOWNORMAL); break;
         case ID_REPORT: report::Show(g_inst, g_hwnd); break;
         case ID_EXIT: DestroyWindow(g_hwnd); break;
         default:
-            if (cmd >= ID_DEVICE_FIRST && cmd < ID_DEVICE_FIRST + keys.size() * DEV_STRIDE) {
+            if (cmd >= ID_LANG_FIRST && cmd < ID_LANG_FIRST + languages.size()) {
+                SetLanguage(languages[cmd - ID_LANG_FIRST].code);
+            } else if (cmd >= ID_MONITOR_FIRST && cmd < ID_MONITOR_FIRST + monitors.size()) {
+                SetWidgetMonitor(monitors[cmd - ID_MONITOR_FIRST].id);
+            } else if (cmd >= ID_DEVICE_FIRST && cmd < ID_DEVICE_FIRST + keys.size() * DEV_STRIDE) {
                 std::wstring key = keys[(cmd - ID_DEVICE_FIRST) / DEV_STRIDE];
                 switch ((cmd - ID_DEVICE_FIRST) % DEV_STRIDE) {
                     case DEV_TOGGLE: ToggleHidden(key); break;
@@ -622,12 +736,54 @@ void ShowMenu() {
 
 // ---- worker thread ----------------------------------------------------------------------------
 
+// `--demo`: one sample device of every brand instead of real ones, for screenshots and for checking the
+// brand colors without owning the hardware. Keys, vendor ids and names are mixed on purpose, so every way
+// of recognising a brand gets used.
+bool g_demo = false;
+
+std::vector<DeviceStatus> DemoDevices() {
+    auto make = [](const wchar_t* key, const wchar_t* name, DeviceKind kind, int pct, unsigned short vid, bool charging) {
+        DeviceStatus s;
+        s.key = key;
+        s.name = name;
+        s.kind = kind;
+        s.percent = pct;
+        s.vid = vid;
+        s.charging = charging;
+        s.via = L"demo";
+        return s;
+    };
+    return {
+        make(L"razer:demo", L"Razer DeathAdder V3 Pro", DeviceKind::Mouse, 78, 0x1532, false),
+        make(L"demo:logi", L"Logitech G PRO X 2 LIGHTSPEED", DeviceKind::Headset, 64, 0x046D, false),
+        make(L"steelseries:demo", L"SteelSeries Arctis Nova 7", DeviceKind::Headset, 55, 0, false),
+        make(L"hsc:1b1c:0a6b", L"Corsair HS80 RGB Wireless", DeviceKind::Headset, 81, 0x1B1C, false),
+        make(L"hyperx:demo", L"HyperX Cloud III Wireless", DeviceKind::Headset, 47, 0, false),
+        make(L"rog:demo", L"ROG Harpe Ace", DeviceKind::Mouse, 90, 0, false),
+        make(L"zowie:demo", L"ZOWIE EC2-CW", DeviceKind::Mouse, 66, 0x04A5, false),
+        make(L"bt:demo-ps", L"Wireless Controller", DeviceKind::Gamepad, 38, 0x054C, false),
+        make(L"xbox:demo", L"Xbox Wireless Controller", DeviceKind::Gamepad, 72, 0x045E, false),
+        make(L"bt:demo-buds", L"Galaxy Buds3 Pro", DeviceKind::Headset, 59, 0, false),
+        make(L"airpods:demo", L"AirPods Pro", DeviceKind::Headset, 85, 0, false),
+        make(L"jabra:demo", L"Jabra Evolve2 65", DeviceKind::Headset, 23, 0x0B0E, false),
+        make(L"jbl:demo", L"JBL Quantum 910", DeviceKind::Headset, 70, 0x0ECB, false),
+        make(L"coolermaster:demo", L"Cooler Master MM712", DeviceKind::Mouse, 12, 0x2516, false),
+        make(L"steam:demo", L"Steam Controller", DeviceKind::Gamepad, 50, 0x28DE, true),
+        make(L"bt:demo-plain", L"Bluetooth Headphones", DeviceKind::Headset, 100, 0, false),
+    };
+}
+
 DWORD WINAPI Worker(LPVOID) {
+    // At sign-in a USB receiver may enumerate before its wireless link is ready.
+    constexpr DWORD startupPollDelays[] = { 3000, 7000, 15000 };
+    size_t startupPoll = 0;
+    HANDLE events[2] = { g_stopEvt, g_refreshEvt };
     for (;;) {
-        auto* v = new std::vector<DeviceStatus>(PollAllDevices());
+        auto* v = new std::vector<DeviceStatus>(g_demo ? DemoDevices() : PollAllDevices());
         if (!PostMessageW(g_hwnd, WM_RESULTS, 0, (LPARAM)v)) delete v;
-        HANDLE hs[2] = { g_stopEvt, g_refreshEvt };
-        if (WaitForMultipleObjects(2, hs, FALSE, POLL_INTERVAL_MS) == WAIT_OBJECT_0) return 0;
+        DWORD delay = POLL_INTERVAL_MS;
+        if (startupPoll < ARRAYSIZE(startupPollDelays)) delay = startupPollDelays[startupPoll++];
+        if (WaitForMultipleObjects(2, events, FALSE, delay) == WAIT_OBJECT_0) return 0;
     }
 }
 
@@ -735,7 +891,9 @@ int ListToConsole(bool dump) {
     auto list = PollAllDevices();
     if (list.empty()) write(L"No devices with battery info found.\n");
     for (auto& s : list) {
-        std::wstring line = s.name + L"  [" + s.via + L"]  ";
+        Accent accent = BrandOf(s);
+        std::wstring line = s.name + L"  [" + s.via + L"]  " +
+                            (accent != Accent::None ? L"{" + std::wstring(StyleOf(accent).name) + L"}  " : L"");
         if (!s.connected) line += L"off / not connected";
         else if (s.asleep) line += L"asleep";
         else if (!s.levelText.empty()) line += s.levelText;
@@ -755,6 +913,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     if (cmdLine && wcsstr(cmdLine, L"--list")) return ListToConsole(false);
     if (cmdLine && wcsstr(cmdLine, L"--dump")) return ListToConsole(true);
     if (cmdLine && wcsstr(cmdLine, L"--report")) {  // the "Request support for a device" window on its own
+        i18n::Init();
         report::Show(inst, nullptr);
         MSG msg;
         while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -772,6 +931,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
         return 0;
     }
     g_inst = inst;
+    g_demo = cmdLine && wcsstr(cmdLine, L"--demo");
 
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\WirelessBatteryTray");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
@@ -799,7 +959,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     g_wantWidget = LoadWidgetMode();
     g_hideLastKnown = LoadHideLastKnown();
     g_widgetBackground = LoadWidgetBackground();
+    g_brandColors = LoadBrandColors();
+    g_stacked = LoadStacked();
+    widget::SetStacked(g_stacked);
     widget::SetBackground(g_widgetBackground);  // remembered by the widget across re-creation
+    i18n::Init();
+    g_widgetMonitor = LoadWidgetMonitor();
+    widget::SetMonitorChoice(g_widgetMonitor);
     LoadHidden();
     LoadOrder();
     Reconcile();

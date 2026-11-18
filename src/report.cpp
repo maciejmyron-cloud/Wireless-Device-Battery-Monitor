@@ -19,6 +19,7 @@
 
 #include "devices.h"
 #include "hid.h"
+#include "i18n.h"
 
 namespace {
 
@@ -357,7 +358,14 @@ std::wstring JsonError(const std::string& reply) {
     return Wide(v);
 }
 
-std::wstring SendRequest(Request req) {
+// What the site answered; the message is put together (and translated) on the UI thread.
+struct SendResult {
+    int status = 0;
+    bool repeat = false;
+    std::wstring error;  // the site's own sentence for a 400
+};
+
+SendResult SendRequest(Request req) {
     std::string reply;
     int status = Post(RequestJson(req), reply);
     if (status == 400 && req.name.empty() && Upper(JsonError(reply)).find(L"NAME") != std::wstring::npos) {
@@ -365,18 +373,18 @@ std::wstring SendRequest(Request req) {
         reply.clear();
         status = Post(RequestJson(req), reply);
     }
-    if (status == 201) return std::wstring(L"Thank you! Your request was sent. You can follow it at ") + kRequestedPage + L".";
-    if (status == 200)
-        return reply.find("\"repeat\":true") != std::string::npos
-                   ? L"You already sent this device in the last 24 hours, so it's on the list. Thank you!"
-                   : std::wstring(L"Thank you! Your request was sent. You can follow it at ") + kRequestedPage + L".";
-    if (status == 400) {
-        std::wstring e = JsonError(reply);
-        return L"The request was not accepted: " + (e.empty() ? std::wstring(L"please check the fields.") : e);
-    }
-    if (status == 429) return L"Too many requests from your network. Please try again in an hour.";
-    if (status == 0) return L"Couldn't reach krisgfx.com. Check your connection, or use \"Copy full report\" and post it on GitHub.";
-    return L"The site answered with an error (" + std::to_wstring(status) + L"). Please try again later.";
+    return { status, reply.find("\"repeat\":true") != std::string::npos, JsonError(reply) };
+}
+
+std::wstring ResultMessage(const SendResult& r) {
+    if (r.status == 201 || (r.status == 200 && !r.repeat))
+        return TF(L"Thank you! Your request was sent. You can follow it at {page}.", { { L"page", kRequestedPage } });
+    if (r.status == 200) return T(L"You already sent this device in the last 24 hours, so it's on the list. Thank you!");
+    if (r.status == 400)
+        return TF(L"The request was not accepted: {reason}", { { L"reason", r.error.empty() ? std::wstring(T(L"please check the fields.")) : r.error } });
+    if (r.status == 429) return T(L"Too many requests from your network. Please try again in an hour.");
+    if (r.status == 0) return T(L"Couldn't reach krisgfx.com. Check your connection, or use \"Copy full report\" and post it on GitHub.");
+    return TF(L"The site answered with an error ({code}). Please try again later.", { { L"code", std::to_wstring(r.status) } });
 }
 
 // ---- window ---------------------------------------------------------------------------------------
@@ -394,8 +402,9 @@ bool g_scanned = false, g_sending = false, g_quitOnClose = false;
 std::wstring Text(int id) {
     HWND h = GetDlgItem(g_wnd, id);
     int n = GetWindowTextLengthW(h);
-    std::wstring s(n, 0);
-    GetWindowTextW(h, s.data(), n + 1);
+    std::wstring s((size_t)n + 1, L'\0');
+    int written = GetWindowTextW(h, s.data(), (int)s.size());
+    s.resize((size_t)std::max(0, written));
     while (!s.empty() && iswspace(s.back())) s.pop_back();
     while (!s.empty() && iswspace(s.front())) s.erase(s.begin());
     return s;
@@ -423,8 +432,9 @@ Request CurrentRequest() {
 
 void UpdatePreview() {
     Request r = CurrentRequest();
-    std::wstring p = L"Device: " + (r.model.empty() ? L"(type the device name)" : r.model) + L"\r\nType: " + r.type +
-                     L"\r\nYour name: " + (r.name.empty() ? L"(not sent)" : r.name + L" (kept private)") + L"\r\nNotes: ";
+    std::wstring p = std::wstring(T(L"Device")) + L": " + (r.model.empty() ? std::wstring(T(L"(type the device name)")) : r.model) +
+                     L"\r\n" + T(L"Type") + L": " + T(r.type) + L"\r\n" + T(L"Your name") + L": " +
+                     (r.name.empty() ? std::wstring(T(L"(not sent)")) : r.name + L" " + T(L"(kept private)")) + L"\r\n" + T(L"Notes") + L": ";
     for (wchar_t ch : r.notes) p += ch == L'\n' ? std::wstring(L"\r\n") : std::wstring(1, ch);
     SetDlgItemTextW(g_wnd, IDC_PREVIEW, p.c_str());
     EnableWindow(GetDlgItem(g_wnd, IDC_SEND), !g_sending && DeviceChosen() && r.model.size() >= 2);
@@ -451,9 +461,9 @@ void FillDevices() {
         swprintf(ids, 16, L"%04X:%04X", c.vid, c.pid);
         SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)(c.name + L"  (" + ids + L")").c_str());
     }
-    SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)L"My device is not in this list");
+    SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)T(L"My device is not in this list"));
     EnableWindow(cb, TRUE);
-    SetStatus(L"Pick the device that isn't shown. Devices with a vendor-specific interface are listed first.");
+    SetStatus(T(L"Pick the device that isn't shown. Devices with a vendor-specific interface are listed first."));
     UpdatePreview();
 }
 
@@ -477,34 +487,34 @@ void CreateControls() {
     MakeFont();
     const int L = 16, W = 428;
     Add(L"STATIC",
-        L"Is one of your devices not shown? Pick it below and send it to us. It goes on the public request list at "
-        L"krisgfx.com/tools, and we'll look into supporting it.",
-        0, -1, L, 12, W, 40);
-    Add(L"STATIC", L"Device", 0, -1, L, 58, W, 18);
-    HWND dev = Add(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, IDC_DEVICE, L, 76, W, 300);
-    SendMessageW(dev, CB_ADDSTRING, 0, (LPARAM)L"Scanning devices...");
+        T(L"Is one of your devices not shown? Pick it below and send it to us. It goes on the public request list at "
+          L"krisgfx.com/tools, and we'll look into supporting it."),
+        0, -1, L, 12, W, 56);
+    Add(L"STATIC", T(L"Device"), 0, -1, L, 74, W, 18);
+    HWND dev = Add(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, IDC_DEVICE, L, 92, W, 300);
+    SendMessageW(dev, CB_ADDSTRING, 0, (LPARAM)T(L"Scanning devices..."));
     SendMessageW(dev, CB_SETCURSEL, 0, 0);
     EnableWindow(dev, FALSE);
-    Add(L"STATIC", L"Device name (as it's sold)", 0, -1, L, 108, W, 18);
-    HWND model = Add(WC_EDITW, L"", ES_AUTOHSCROLL | WS_TABSTOP, IDC_MODEL, L, 126, W, 24, WS_EX_CLIENTEDGE);
+    Add(L"STATIC", T(L"Device name (as it's sold)"), 0, -1, L, 124, W, 18);
+    HWND model = Add(WC_EDITW, L"", ES_AUTOHSCROLL | WS_TABSTOP, IDC_MODEL, L, 142, W, 24, WS_EX_CLIENTEDGE);
     SendMessageW(model, EM_LIMITTEXT, 80, 0);
-    Add(L"STATIC", L"Type", 0, -1, L, 158, W, 18);
-    HWND type = Add(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, IDC_TYPE, L, 176, 200, 200);
-    for (auto t : kTypes) SendMessageW(type, CB_ADDSTRING, 0, (LPARAM)t);
+    Add(L"STATIC", T(L"Type"), 0, -1, L, 174, W, 18);
+    HWND type = Add(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, IDC_TYPE, L, 192, 200, 200);
+    for (auto t : kTypes) SendMessageW(type, CB_ADDSTRING, 0, (LPARAM)T(t));  // shown translated, sent in English
     SendMessageW(type, CB_SETCURSEL, 4, 0);
-    Add(L"STATIC", L"Your name (optional, kept private and never shown)", 0, -1, L, 208, W, 18);
-    HWND name = Add(WC_EDITW, L"", ES_AUTOHSCROLL | WS_TABSTOP, IDC_NAME, L, 226, W, 24, WS_EX_CLIENTEDGE);
+    Add(L"STATIC", T(L"Your name (optional, kept private and never shown)"), 0, -1, L, 224, W, 18);
+    HWND name = Add(WC_EDITW, L"", ES_AUTOHSCROLL | WS_TABSTOP, IDC_NAME, L, 242, W, 24, WS_EX_CLIENTEDGE);
     SendMessageW(name, EM_LIMITTEXT, 40, 0);
-    Add(L"STATIC", L"Anything else we should know? (optional)", 0, -1, L, 258, W, 18);
-    HWND notes = Add(WC_EDITW, L"", ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_TABSTOP, IDC_NOTES, L, 276, W, 54,
+    Add(L"STATIC", T(L"Anything else we should know? (optional)"), 0, -1, L, 274, W, 18);
+    HWND notes = Add(WC_EDITW, L"", ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_TABSTOP, IDC_NOTES, L, 292, W, 54,
                      WS_EX_CLIENTEDGE);
     SendMessageW(notes, EM_LIMITTEXT, 200, 0);
-    Add(L"STATIC", L"This is exactly what will be sent:", 0, -1, L, 338, W, 18);
-    Add(WC_EDITW, L"", ES_MULTILINE | ES_READONLY | WS_VSCROLL | WS_TABSTOP, IDC_PREVIEW, L, 356, W, 110, WS_EX_CLIENTEDGE);
-    Add(L"STATIC", L"Scanning your devices...", 0, IDC_STATUS, L, 474, W, 36);
-    Add(WC_BUTTONW, L"Copy full report", WS_TABSTOP, IDC_COPY, L, 516, 140, 28);
-    Add(WC_BUTTONW, L"Send", BS_DEFPUSHBUTTON | WS_TABSTOP, IDC_SEND, L + W - 186, 516, 90, 28);
-    Add(WC_BUTTONW, L"Close", WS_TABSTOP, IDCANCEL, L + W - 90, 516, 90, 28);
+    Add(L"STATIC", T(L"This is exactly what will be sent:"), 0, -1, L, 354, W, 18);
+    Add(WC_EDITW, L"", ES_MULTILINE | ES_READONLY | WS_VSCROLL | WS_TABSTOP, IDC_PREVIEW, L, 372, W, 110, WS_EX_CLIENTEDGE);
+    Add(L"STATIC", T(L"Scanning your devices..."), 0, IDC_STATUS, L, 490, W, 36);
+    Add(WC_BUTTONW, T(L"Copy full report"), WS_TABSTOP, IDC_COPY, L, 532, 226, 28);
+    Add(WC_BUTTONW, T(L"Send"), BS_DEFPUSHBUTTON | WS_TABSTOP, IDC_SEND, L + W - 186, 532, 90, 28);
+    Add(WC_BUTTONW, T(L"Close"), WS_TABSTOP, IDCANCEL, L + W - 90, 532, 90, 28);
     EnableWindow(GetDlgItem(g_wnd, IDC_SEND), FALSE);
 }
 
@@ -525,7 +535,7 @@ struct SendJob {
 
 DWORD WINAPI SendThread(LPVOID p) {
     std::unique_ptr<SendJob> job((SendJob*)p);
-    PostOrDelete(job->wnd, WM_SENT, new std::wstring(SendRequest(job->req)));
+    PostOrDelete(job->wnd, WM_SENT, new SendResult(SendRequest(job->req)));
     return 0;
 }
 
@@ -559,10 +569,41 @@ void CopyToClipboard(const std::wstring& text) {
     CloseClipboard();
 }
 
+bool LightTheme(const wchar_t* value) {
+    DWORD v = 1, sz = sizeof(v);
+    RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", value,
+                 RRF_RT_REG_DWORD, nullptr, &v, &sz);
+    return v != 0;
+}
+
+// Title bar follows the Windows app theme, with the matching icon: white (icon 1) on dark, black (icon 2) on
+// light. The taskbar button's icon follows the taskbar's own theme.
+void ApplyTheme(HWND h) {
+    bool lightApps = LightTheme(L"AppsUseLightTheme"), lightTaskbar = LightTheme(L"SystemUsesLightTheme");
+    using SetAttrFn = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+    if (HMODULE dwm = LoadLibraryW(L"dwmapi.dll")) {
+        if (auto fn = (SetAttrFn)GetProcAddress(dwm, "DwmSetWindowAttribute")) {
+            BOOL dark = !lightApps;
+            fn(h, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
+        }
+    }
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+    auto icon = [&](bool light, int cx, int cy) {
+        return (LPARAM)LoadImageW(inst, MAKEINTRESOURCEW(light ? 2 : 1), IMAGE_ICON, GetSystemMetrics(cx),
+                                  GetSystemMetrics(cy), LR_SHARED);
+    };
+    SendMessageW(h, WM_SETICON, ICON_SMALL, icon(lightApps, SM_CXSMICON, SM_CYSMICON));
+    SendMessageW(h, WM_SETICON, ICON_BIG, icon(lightTaskbar, SM_CXICON, SM_CYICON));
+}
+
 LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+        case WM_SETTINGCHANGE:
+            if (lp && !lstrcmpW((LPCWSTR)lp, L"ImmersiveColorSet")) ApplyTheme(h);
+            break;
         case WM_CREATE:
             g_wnd = h;
+            ApplyTheme(h);
             CreateControls();
             StartThread(ScanThread, h);
             return 0;
@@ -574,9 +615,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_SENT: {
-            std::unique_ptr<std::wstring> s((std::wstring*)lp);
+            std::unique_ptr<SendResult> s((SendResult*)lp);
             g_sending = false;
-            SetStatus(*s);
+            SetStatus(ResultMessage(*s));
             UpdatePreview();
             return 0;
         }
@@ -584,7 +625,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             std::unique_ptr<std::wstring> s((std::wstring*)lp);
             CopyToClipboard(*s);
             EnableWindow(GetDlgItem(h, IDC_COPY), TRUE);
-            SetStatus(L"The full report is copied. Paste it into a GitHub issue if we ask for more details.");
+            SetStatus(T(L"The full report is copied. Paste it into a GitHub issue if we ask for more details."));
             return 0;
         }
         case WM_COMMAND: {
@@ -596,13 +637,13 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if ((id == IDC_SEND || id == IDOK) && IsWindowEnabled(GetDlgItem(h, IDC_SEND))) {
                 g_sending = true;
                 EnableWindow(GetDlgItem(h, IDC_SEND), FALSE);
-                SetStatus(L"Sending...");
+                SetStatus(T(L"Sending..."));
                 StartThread(SendThread, new SendJob{ h, CurrentRequest() });
                 return 0;
             }
             if (id == IDC_COPY) {
                 EnableWindow(GetDlgItem(h, IDC_COPY), FALSE);
-                SetStatus(L"Collecting the full report (this takes about 10 seconds)...");
+                SetStatus(T(L"Collecting the full report (this takes about 10 seconds)..."));
                 const Candidate* c = Selected();
                 std::wstring header = L"Wireless Battery device report\nWindows build " + WindowsBuild() + L"\n";
                 if (c) {
@@ -647,7 +688,7 @@ void Show(HINSTANCE inst, HWND owner) {
         wc.lpfnWndProc = WndProc;
         wc.hInstance = inst;
         wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
-        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
         wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
         wc.lpszClassName = kClass;
         RegisterClassExW(&wc);
@@ -663,13 +704,13 @@ void Show(HINSTANCE inst, HWND owner) {
         if (auto fn = (GetDpiForMonitorFn)GetProcAddress(shcore, "GetDpiForMonitor")) fn(mon, 0, &dpiX, &dpiY);
     }
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT rc{ 0, 0, MulDiv(460, dpiX, 96), MulDiv(560, dpiX, 96) };
+    RECT rc{ 0, 0, MulDiv(460, dpiX, 96), MulDiv(576, dpiX, 96) };
     AdjustWindowRectExForDpi(&rc, style, FALSE, 0, dpiX);
     MONITORINFO mi{ sizeof(mi) };
     GetMonitorInfoW(mon, &mi);
     int w = rc.right - rc.left, hgt = rc.bottom - rc.top;
     int x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - w) / 2, y = mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - hgt) / 2;
-    HWND h = CreateWindowExW(0, kClass, L"Wireless Battery: request support for a device", style, x, y, w, hgt, nullptr, nullptr, inst,
+    HWND h = CreateWindowExW(i18n::Rtl() ? WS_EX_LAYOUTRTL : 0, kClass, (std::wstring(L"Wireless Battery: ") + T(L"request support for a device")).c_str(), style, x, y, w, hgt, nullptr, nullptr, inst,
                              nullptr);
     g_quitOnClose = owner == nullptr;
     if (!h) return;

@@ -4,7 +4,9 @@ rem Every .cpp file in src\ and src\drivers\ is compiled, so a new driver needs 
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 if not exist build mkdir build
-windres -i res\app.rc -o build\app_res.o --include-dir res || exit /b 1
+rem Every lang\*.txt is a built-in UI language: joined into one resource, each after an "@file <name>" line.
+(for %%f in (lang\*.txt) do (echo @file %%~nf& type "%%f"& echo.)) > build\languages.txt
+windres -i res\app.rc -o build\app_res.o --include-dir res --include-dir build || exit /b 1
 set SOURCES=
 for %%f in (src\*.cpp src\drivers\*.cpp) do set SOURCES=!SOURCES! %%f
 g++ -std=c++17 -Os -municode -mwindows -static -s -ffunction-sections -fdata-sections -Wl,--gc-sections ^

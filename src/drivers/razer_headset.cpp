@@ -32,6 +32,12 @@
 // cmd 21 = battery 0-100, cmd 2A = cable (00 / 01).
 // Protocol from github.com/mehdibouchami/razer-barracuda-x-battery (YS-Tech framing) and
 // github.com/nightdevx/barracuda-x-battery (checked on a 1532:0550 receiver).
+//
+// The later receiver revision 1532:0552 ("Barracuda X 2.4", vendor collection FF00:0000) has a Macronix bridge
+// with report id 01 and no CRC or 'O' / 'F' acknowledgement. It is put in app mode first: [01 40] -> [01 40 01 01].
+// Output report [01][80][len][payload..], input reports [01][80][len][stream..]; the Airoha commands and frames
+// inside are the same as on 0550. Framing from github.com/KhromotozzDevOut/razer-barracuda-battery-tray and
+// issue #277.
 #include "drivers.h"
 
 #include <algorithm>
@@ -70,6 +76,8 @@ struct Cached { ULONGLONG at = 0; DeviceStatus status; bool valid = false; };
 std::map<USHORT, Cached> g_cache;
 
 const wchar_t* Name(USHORT pid) { return (pid == 0x0576 || pid == 0x0577) ? L"Razer BlackShark V3 Pro" : L"Razer BlackShark V3"; }
+// The lower id of each pair is the USB cable, the higher one the wireless receiver (0579 cable / 057A receiver).
+bool Cable(USHORT pid) { return pid == 0x0576 || pid == 0x0579; }
 
 // ---- BlackShark V2 HyperSpeed: MediaTek vendor HID (NOT V2 Pro PA protocol) ----------------------
 // Based on justik13/razer-blackshark-v2-hyperspeed-webhid (MIT).
@@ -284,13 +292,35 @@ USHORT Crc16Xmodem(const std::vector<BYTE>& data) {
 
 class BarracudaLink {
 public:
-    bool Open(const HidColl& c) { return dev_.Open(c); }
+    // macronix: the 1532:0552 receiver, which has to be switched to app mode before it takes commands.
+    bool Open(const HidColl& c, bool macronix) {
+        macronix_ = macronix;
+        if (!dev_.Open(c)) return false;
+        if (!macronix_) return true;
+        dev_.Flush();
+        if (!dev_.Write({ 0x01, 0x40 })) return false;
+        ULONGLONG end = GetTickCount64() + 500;
+        for (;;) {
+            int left = (int)((LONGLONG)end - (LONGLONG)GetTickCount64());
+            std::vector<BYTE> r;
+            if (left <= 0 || dev_.Read(r, left) < 4) return false;
+            if (r[0] == 0x01 && r[1] == 0x40) return r[2] == 0x01 && r[3] == 0x01;
+        }
+    }
 
     // Sends one Airoha command [50 41][group][seq][body..]; the sequence number is kept in seq_.
     bool Command(BYTE group, std::initializer_list<BYTE> body) {
         seq_ = (BYTE)(seq_ % 127 + 1);
         std::vector<BYTE> payload = { 0x50, 0x41, group, seq_ };
         payload.insert(payload.end(), body);
+        if (macronix_) {
+            std::vector<BYTE> f(64, 0);
+            f[0] = 0x01;
+            f[1] = 0x80;
+            f[2] = (BYTE)payload.size();
+            std::copy(payload.begin(), payload.end(), f.begin() + 3);
+            return dev_.Write(f);
+        }
         std::vector<BYTE> f(64, 0);
         f[0] = 0x02;
         f[1] = 0x80;
@@ -327,7 +357,12 @@ public:
             int left = (int)((LONGLONG)end - (LONGLONG)GetTickCount64());
             std::vector<BYTE> r;
             if (left <= 0 || dev_.Read(r, left) < 2) return false;
-            if (r[0] == 0x02 && (size_t)r[1] + 2 <= r.size()) stream_.insert(stream_.end(), r.begin() + 2, r.begin() + 2 + r[1]);
+            if (macronix_) {
+                if (r.size() >= 3 && r[0] == 0x01 && r[1] == 0x80 && (size_t)r[2] + 3 <= r.size())
+                    stream_.insert(stream_.end(), r.begin() + 3, r.begin() + 3 + r[2]);
+            } else if (r[0] == 0x02 && (size_t)r[1] + 2 <= r.size()) {
+                stream_.insert(stream_.end(), r.begin() + 2, r.begin() + 2 + r[1]);
+            }
         }
     }
 
@@ -344,8 +379,7 @@ public:
     int Get(BYTE cmd) {
         std::vector<BYTE> f;
         if (!Command(0x08, { 0x03, cmd, 0x00, 0x00 })) return -1;
-        bool ok = Await([cmd](const std::vector<BYTE>& r) { return r.size() >= 13 && r[2] == 0x08 && r[10] == cmd && r[11] == 0x01; }, 1000, f);
-        return (ok && f[12] >= 1 && f.size() >= 14) ? f[13] : -1;
+        bool ok = Await([cmd](const std::vector<BYTE>& r) { return r.size() >= 13 && r[2] == 0x08 && r[10] == cmd && r[11] == 0x01; }, 1000, f);        return (ok && f[12] >= 1 && f.size() >= 14) ? f[13] : -1;
     }
 
 private:
@@ -353,29 +387,33 @@ private:
     HidDev dev_;
     std::vector<BYTE> stream_;
     BYTE seq_ = 0;
+    bool macronix_ = false;
 };
 
 void PollBarracudaX(PollContext& ctx) {
-    const USHORT pid = 0x0550;
-    if (ctx.IsClaimed(0x1532, pid)) return;
-    auto colls = ctx.Find(0x1532, pid, [](const HidColl& c) { return c.page() == 0xFF00 && c.usage() == 0x0001 && c.outLen() >= 64 && c.inLen() >= 64; });
-    for (const HidColl* c : colls) {
-        BarracudaLink link;
-        if (!link.Open(*c)) continue;
-        if (!link.RemoteMode(true)) continue;  // receiver without a connected headset (off, out of range, Bluetooth mode)
-        int level = link.Get(0x21);
-        int cable = level >= 0 ? link.Get(0x2A) : -1;
-        link.RemoteMode(false);
-        if (level < 0 || level > 100) continue;
-        DeviceStatus s;
-        s.key = L"barracuda:" + Hex4(pid);
-        s.name = L"Razer Barracuda X (2022)";
-        s.kind = DeviceKind::Headset;
-        s.via = L"2.4 GHz receiver";
-        s.percent = level;
-        s.charging = cable == 1;
-        ctx.Add(s, 0x1532, pid);
-        return;
+    for (USHORT pid : { (USHORT)0x0550, (USHORT)0x0552 }) {
+        if (ctx.IsClaimed(0x1532, pid)) continue;
+        const bool macronix = pid == 0x0552;
+        const USHORT usage = macronix ? 0x0000 : 0x0001;
+        auto colls = ctx.Find(0x1532, pid, [usage](const HidColl& c) { return c.page() == 0xFF00 && c.usage() == usage && c.outLen() >= 64 && c.inLen() >= 64; });
+        for (const HidColl* c : colls) {
+            BarracudaLink link;
+            if (!link.Open(*c, macronix)) continue;
+            if (!link.RemoteMode(true)) continue;  // receiver without a connected headset (off, out of range, Bluetooth mode)
+            int level = link.Get(0x21);
+            int cable = level >= 0 ? link.Get(0x2A) : -1;
+            link.RemoteMode(false);
+            if (level < 0 || level > 100) continue;
+            DeviceStatus s;
+            s.key = L"barracuda:" + Hex4(pid);
+            s.name = L"Razer Barracuda X (2022)";
+            s.kind = DeviceKind::Headset;
+            s.via = L"2.4 GHz receiver";
+            s.percent = level;
+            s.charging = cable == 1;
+            ctx.Add(s, 0x1532, pid);
+            break;
+        }
     }
 }
 
@@ -462,13 +500,15 @@ void PollRazerHeadsets(PollContext& ctx) {
         d.Flush();
         std::vector<BYTE> r;
         if (!Get(d, 0x21, r) || r[13] > 100) continue;
+        std::vector<BYTE> cableState;
+        const bool cableCharging = Get(d, 0x2A, cableState) && cableState[13] == 1;
         DeviceStatus s;
         s.key = L"blackshark:" + Hex4(pid);
         s.name = Name(pid);
         s.kind = DeviceKind::Headset;
-        s.via = L"2.4 GHz receiver";
+        s.via = Cable(pid) ? L"USB cable" : L"2.4 GHz receiver";
         s.percent = r[13];
-        s.charging = r[14] != 0;
+        s.charging = r[14] != 0 || cableCharging;
         cache = { GetTickCount64(), s, true };
         ctx.Add(s, 0x1532, pid);
     }
